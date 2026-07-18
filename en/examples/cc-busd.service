@@ -1,0 +1,15 @@
+[Unit]
+Description=cc-bus broker daemon (multi Claude Code instance message-bus routing)
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/cc-busd run
+Restart=on-failure
+RestartSec=2
+# To customize the runtime root / knobs, uncomment:
+# Environment=CC_BUS_HOME=%h/.cc-bus
+# Environment=CCBUS_POLL=0.5
+
+[Install]
+WantedBy=default.target

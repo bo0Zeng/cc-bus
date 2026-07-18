@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# cc-whoami  打印本 agent 的总线身份(自动从 tmux 认领,无需手动设 id)。
+# 优先级:$CC_BUS_ID(可选覆盖) → pane 标签 @cc_id(同会话多 CC 时细分) → tmux 会话名。
+# 全部消毒成 [A-Za-z0-9_-](要当文件名);取不到则报错退出(不在 tmux 且没设 CC_BUS_ID)。
+set -uo pipefail
+
+resolve(){ printf '%s' "${1:-}" | sed 's/[^A-Za-z0-9_-]/-/g; s/^-*//; s/-*$//'; }
+
+id=""
+[ -n "${CC_BUS_ID:-}" ] && id=$(resolve "$CC_BUS_ID")
+if [ -z "$id" ] && [ -n "${TMUX_PANE:-}" ]; then
+  tag=$(tmux show-options -pqv -t "$TMUX_PANE" @cc_id 2>/dev/null || true)
+  id=$(resolve "$tag")
+fi
+if [ -z "$id" ] && [ -n "${TMUX_PANE:-}" ]; then
+  sess=$(tmux display-message -p -t "$TMUX_PANE" '#{session_name}' 2>/dev/null || true)
+  id=$(resolve "$sess")
+fi
+
+if [ -n "$id" ]; then printf '%s\n' "$id"; exit 0; fi
+echo "cc-whoami: 不在 tmux 且未设 CC_BUS_ID,无法确定身份" >&2
+exit 1

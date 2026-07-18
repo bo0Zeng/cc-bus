@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# cc-kill <id>  收掉一个会话(通常是 cc-spawn 派生的):杀会话+进程树 + 清名册/台账 + 清其状态。
+set -euo pipefail
+BUS="${CC_BUS_HOME:-$HOME/.cc-bus}"
+id="${1:?用法: cc-kill <id>}"
+case "$id" in *[!A-Za-z0-9_-]*|'') echo "cc-kill: 非法 id '$id'" >&2; exit 2;; esac
+
+# 递归收集一个 pid 的整棵进程树(含自己)
+_tree(){ local p="$1" c; echo "$p"; for c in $(pgrep -P "$p" 2>/dev/null); do _tree "$c"; done; }
+
+# 杀会话 + 进程树。claude 可能 trap SIGHUP 扛过 kill-session 并被 init 收养 →
+# 必须【kill-session 前】收好整棵树,【之后无条件】清 survivors(不能只看 pane_pid 存活与否)。
+if tmux has-session -t "=$id" 2>/dev/null; then
+  ppid=$(tmux list-panes -t "=$id" -F '#{pane_pid}' 2>/dev/null | head -1)
+  procs=""; [ -n "${ppid:-}" ] && procs=$(_tree "$ppid" 2>/dev/null || true)
+  tmux kill-session -t "=$id" 2>/dev/null && echo "已杀会话 $id" || echo "杀会话 $id 失败" >&2
+  if [ -n "${procs:-}" ]; then
+    kill $procs 2>/dev/null || true; sleep 0.3; kill -9 $procs 2>/dev/null || true
+  fi
+else
+  echo "无 tmux 会话 $id(可能已退)"
+fi
+
+# 名册清除(flock;成功才 mv,失败不动原文件,免 awk 出错清空整库)
+touch "$BUS/agents.tsv"
+(
+  flock 9
+  if awk -F'\t' -v id="$id" '$1!=id' "$BUS/agents.tsv" > "$BUS/agents.tsv.tmp.$$" 2>/dev/null; then
+    mv "$BUS/agents.tsv.tmp.$$" "$BUS/agents.tsv"
+  else rm -f "$BUS/agents.tsv.tmp.$$"; fi
+) 9>>"$BUS/agents.tsv.lock"
+
+# 台账清除(flock)
+if [ -f "$BUS/spawned.tsv" ]; then
+  (
+    flock 8
+    if awk -F'\t' -v id="$id" '$1!=id' "$BUS/spawned.tsv" > "$BUS/spawned.tsv.tmp.$$" 2>/dev/null; then
+      mv "$BUS/spawned.tsv.tmp.$$" "$BUS/spawned.tsv"
+    else rm -f "$BUS/spawned.tsv.tmp.$$"; fi
+  ) 8>>"$BUS/spawned.tsv.lock"
+fi
+
+# 清该 id 的状态:id-keyed + pair-keyed(免 respawn 同 id 串到旧因果链/旧去重)
+rm -f "$BUS/inbox/$id.jsonl" "$BUS/inbox/$id.jsonl.lock" \
+      "$BUS/state/$id.pos" "$BUS/state/nudge-$id" "$BUS/state/nudge-$id.lock" \
+      "$BUS/state/dedup-$id" "$BUS/state/dedup-$id.lock" \
+      "$BUS/state/rate-${id}__"* "$BUS/state/rate-"*"__${id}" \
+      "$BUS/state/lastread-${id}__"* "$BUS/state/lastread-"*"__${id}" 2>/dev/null || true
+echo "已清 $id 的名册/台账/状态"

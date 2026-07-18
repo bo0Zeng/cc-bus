@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# cc-send <to> <消息...>  组信封 v2 → 原子入队 → cc-busd 处理(不在则就地 source 库跑管线兜底)
+set -euo pipefail
+BUS="${CC_BUS_HOME:-$HOME/.cc-bus}"
+SELFDIR=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)   # 解析 symlink,确保能找到同目录的 lib
+# shellcheck source=cc-bus-lib.sh
+. "$SELFDIR/cc-bus-lib.sh"
+
+new_chain=0; msg_class="direct"
+while true; do
+  case "${1:-}" in
+    --new)       new_chain=1; shift;;                    # 强制新因果链(新话题)
+    --broadcast) msg_class="broadcast"; new_chain=1; shift;;  # 广播:标记 class + 不接因果链
+    --)          shift; break;;                          # 显式结束旗标(其后即使是 --xx 也当收件人)
+    *) break;;
+  esac
+done
+to="${1:?用法: cc-send [--new|--broadcast] <to> <消息...>}"; shift
+# 收件人 id 会拼进文件路径,白名单校验防路径穿越
+case "$to" in *[!A-Za-z0-9_-]*|'') echo "cc-send: 非法收件人 '$to'(仅 [A-Za-z0-9_-])" >&2; exit 2;; esac
+text="$*"
+from=$("$SELFDIR/cc-whoami" 2>/dev/null || echo unknown)   # 身份自动从 tmux 认领
+mkdir -p "$BUS/inbox" "$BUS/state" "$BUS/log" "$BUS/queue"
+route_load_config
+
+ts=$(date -Iseconds)
+id="${from}-$(date +%s%N)-${RANDOM}"
+# 因果链自动接续:若 from 最近读过 to 的消息(lastread 存在且 id≠-),本条视为回复
+irt=""; trace="$from"; hops=0
+lr="$BUS/state/lastread-${from}__${to}"
+if [ "$new_chain" = 0 ] && [ -f "$lr" ]; then
+  IFS=$'\t' read -r p_id p_hops p_trace < "$lr" 2>/dev/null || true
+  if [ -n "${p_id:-}" ] && [ "$p_id" != "-" ]; then
+    irt="$p_id"
+    if [[ "${p_hops:-}" =~ ^[0-9]+$ ]]; then hops=$((p_hops+1)); else hops=1; fi
+    trace="${p_trace:+$p_trace,}$from"   # p_trace 损坏为空时用单元素,不产生 from,from
+  fi
+fi
+env=$(jq -cn --arg id "$id" --arg from "$from" --arg to "$to" --arg ts "$ts" \
+   --arg text "$text" --arg class "$msg_class" --arg irt "$irt" \
+   --arg trace "$trace" --argjson hops "$hops" \
+   '{id:$id,from:$from,to:$to,ts:$ts,text:$text,class:$class,in_reply_to:(if $irt=="" then null else $irt end),trace:$trace,hops:$hops,prio:0}')
+
+# 原子入队。文件名用纳秒,给 F04 按序消费留更细的时间分辨率
+seq="$$-$RANDOM"
+qf="$BUS/queue/$(date +%s%N)-$seq.json"
+tmpq="$BUS/queue/.tmp.$seq"
+printf '%s\n' "$env" > "$tmpq"
+mv "$tmpq" "$qf"
+
+if daemon_running; then
+  echo "已入队(cc-busd 处理)-> $to"
+else
+  # 兜底:认领文件用【点前缀】(躲开 daemon 顶层队列扫描,防双投),原子改名占用后就地跑管线
+  proc="$BUS/queue/.proc.$$.${qf##*/}"
+  if mv "$qf" "$proc" 2>/dev/null; then
+    set +e; route_process "$(cat "$proc")"; rc=$?; set -e
+    case "$rc" in
+      0)  rm -f "$proc"; echo "已投递(兜底:cc-busd 未运行)-> $to";;
+      10) rm -f "$proc"; echo "被路由层拦截(见 bus.log)-> $to" >&2; exit 3;;
+      *)  mv "$proc" "$qf" 2>/dev/null || true
+          echo "cc-send: 处理失败,已退回队列(可重试)-> $to" >&2; exit 1;;
+    esac
+  else
+    echo "已入队(被 cc-busd 抢先认领)-> $to"
+  fi
+fi

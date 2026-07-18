@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# cc-bus Stop 钩子:CC 想结束本轮时,先排空 inbox;有新消息就拦下并喂回给 Claude
+set -euo pipefail
+BUS="${CC_BUS_HOME:-$HOME/.cc-bus}"
+SELFDIR=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+cat >/dev/null                     # CC 从 stdin 传入 JSON(含 stop_hook_active 等),这里不需要就丢弃
+id=$("$SELFDIR/cc-whoami" 2>/dev/null || true)
+[ -n "$id" ] || exit 0             # 不在 tmux/无身份 = 不是 bus 成员,直接放行(非 bus 会话零影响)
+msgs=$("$SELFDIR/cc-recv" "$id" 2>/dev/null || true)
+if [ -n "$msgs" ]; then
+  reason="你收到新的 cc-bus 消息,请先处理完再结束本轮:
+$msgs"
+  jq -cn --arg r "$reason" '{decision:"block", reason:$r}'   # 拦下结束,把消息喂给 Claude
+fi
+exit 0

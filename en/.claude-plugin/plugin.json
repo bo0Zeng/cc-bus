@@ -1,0 +1,17 @@
+{
+  "name": "cc-bus",
+  "version": "0.1.0",
+  "description": "A message bus for multiple independent Claude Code instances in tmux: send / relay / broadcast messages between running sessions, spawn dir-rooted collaborator sessions, with smart routing (ACL / rate-limit / dedup / loop-cut / nudge-debounce), an optional broker daemon, and inline fallback.",
+  "author": {
+    "name": "zbl"
+  },
+  "license": "MIT",
+  "keywords": [
+    "claude-code",
+    "multi-agent",
+    "tmux",
+    "message-bus",
+    "cc-bus",
+    "agent-communication"
+  ]
+}

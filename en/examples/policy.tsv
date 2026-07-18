@@ -1,0 +1,13 @@
+# cc-bus ACL policy example — copy to ~/.cc-bus/policy.tsv, and set CCBUS_POLICY_MODE=on in
+# config for it to take effect.
+# Each line:  <from-glob><TAB><comma-separated allowed to-globs>
+# The first rule matching `from` wins; lines starting with # are comments; columns are separated
+# by a real TAB.
+#
+# Star-topology example: worker* can only send to coordinator, coordinator can send to all,
+# everyone else is mutually unreachable.
+# worker*	coordinator
+# coordinator	*
+#
+# Pass everything (equivalent to POLICY_MODE=off):
+# *	*

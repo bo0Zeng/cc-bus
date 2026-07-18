@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# cc-kill <id>  Kill a session (usually one spawned by cc-spawn): kill the session+process tree + clear roster/ledger + clear its state.
+set -euo pipefail
+BUS="${CC_BUS_HOME:-$HOME/.cc-bus}"
+id="${1:?Usage: cc-kill <id>}"
+case "$id" in *[!A-Za-z0-9_-]*|'') echo "cc-kill: invalid id '$id'" >&2; exit 2;; esac
+
+# Recursively collect the whole process tree of a pid (including itself)
+_tree(){ local p="$1" c; echo "$p"; for c in $(pgrep -P "$p" 2>/dev/null); do _tree "$c"; done; }
+
+# Kill session + process tree. claude may trap SIGHUP, survive kill-session, and get adopted by init →
+# the whole tree MUST be collected before kill-session, and survivors MUST be cleared unconditionally afterward (can't just check whether pane_pid is still alive).
+if tmux has-session -t "=$id" 2>/dev/null; then
+  ppid=$(tmux list-panes -t "=$id" -F '#{pane_pid}' 2>/dev/null | head -1)
+  procs=""; [ -n "${ppid:-}" ] && procs=$(_tree "$ppid" 2>/dev/null || true)
+  tmux kill-session -t "=$id" 2>/dev/null && echo "session $id killed" || echo "failed to kill session $id" >&2
+  if [ -n "${procs:-}" ]; then
+    kill $procs 2>/dev/null || true; sleep 0.3; kill -9 $procs 2>/dev/null || true
+  fi
+else
+  echo "no tmux session $id (may have already exited)"
+fi
+
+# Clear roster entry (flock; only mv on success, leave original file untouched on failure, avoids wiping the whole store on an awk error)
+touch "$BUS/agents.tsv"
+(
+  flock 9
+  if awk -F'\t' -v id="$id" '$1!=id' "$BUS/agents.tsv" > "$BUS/agents.tsv.tmp.$$" 2>/dev/null; then
+    mv "$BUS/agents.tsv.tmp.$$" "$BUS/agents.tsv"
+  else rm -f "$BUS/agents.tsv.tmp.$$"; fi
+) 9>>"$BUS/agents.tsv.lock"
+
+# Clear ledger entry (flock)
+if [ -f "$BUS/spawned.tsv" ]; then
+  (
+    flock 8
+    if awk -F'\t' -v id="$id" '$1!=id' "$BUS/spawned.tsv" > "$BUS/spawned.tsv.tmp.$$" 2>/dev/null; then
+      mv "$BUS/spawned.tsv.tmp.$$" "$BUS/spawned.tsv"
+    else rm -f "$BUS/spawned.tsv.tmp.$$"; fi
+  ) 8>>"$BUS/spawned.tsv.lock"
+fi
+
+# Clear this id's state: id-keyed + pair-keyed (avoids a respawn under the same id inheriting stale causal chains/stale dedup)
+rm -f "$BUS/inbox/$id.jsonl" "$BUS/inbox/$id.jsonl.lock" \
+      "$BUS/state/$id.pos" "$BUS/state/nudge-$id" "$BUS/state/nudge-$id.lock" \
+      "$BUS/state/dedup-$id" "$BUS/state/dedup-$id.lock" \
+      "$BUS/state/rate-${id}__"* "$BUS/state/rate-"*"__${id}" \
+      "$BUS/state/lastread-${id}__"* "$BUS/state/lastread-"*"__${id}" 2>/dev/null || true
+echo "cleared roster/ledger/state for $id"

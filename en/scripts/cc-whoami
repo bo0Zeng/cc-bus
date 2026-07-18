@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# cc-whoami  Print this agent's bus identity (auto-claimed from tmux, no need to manually set an id).
+# Priority: $CC_BUS_ID (optional override) → pane tag @cc_id (to distinguish multiple CCs in the same session) → tmux session name.
+# All sanitized to [A-Za-z0-9_-] (will be used as a filename); exits with an error if none can be resolved (not in tmux and CC_BUS_ID not set).
+set -uo pipefail
+
+resolve(){ printf '%s' "${1:-}" | sed 's/[^A-Za-z0-9_-]/-/g; s/^-*//; s/-*$//'; }
+
+id=""
+[ -n "${CC_BUS_ID:-}" ] && id=$(resolve "$CC_BUS_ID")
+if [ -z "$id" ] && [ -n "${TMUX_PANE:-}" ]; then
+  tag=$(tmux show-options -pqv -t "$TMUX_PANE" @cc_id 2>/dev/null || true)
+  id=$(resolve "$tag")
+fi
+if [ -z "$id" ] && [ -n "${TMUX_PANE:-}" ]; then
+  sess=$(tmux display-message -p -t "$TMUX_PANE" '#{session_name}' 2>/dev/null || true)
+  id=$(resolve "$sess")
+fi
+
+if [ -n "$id" ]; then printf '%s\n' "$id"; exit 0; fi
+echo "cc-whoami: not in tmux and CC_BUS_ID not set, cannot determine identity" >&2
+exit 1

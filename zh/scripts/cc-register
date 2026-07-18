@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# cc-register <id>  把"当前 tmux pane"登记为 agent <id> 的地址
+set -euo pipefail
+BUS="${CC_BUS_HOME:-$HOME/.cc-bus}"
+SELFDIR=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+# 无参则从 tmux 自动认领身份(cc-whoami);不在 tmux/无身份则静默不登记(非 bus 成员)
+if [ -n "${1:-}" ]; then id="$1"; else id=$("$SELFDIR/cc-whoami") || exit 0; fi
+# id 会拼进文件路径,做白名单校验防路径穿越
+case "$id" in *[!A-Za-z0-9_-]*|'') echo "cc-register: 非法/空 id '$id'" >&2; exit 2;; esac
+mkdir -p "$BUS/inbox" "$BUS/state" "$BUS/log"
+if [ -z "${TMUX_PANE:-}" ]; then
+  echo "cc-register: 不在 tmux 里(TMUX_PANE 为空),无法登记地址" >&2
+  exit 1
+fi
+target=$(tmux display-message -p -t "$TMUX_PANE" '#{session_name}:#{window_index}.#{pane_index}')
+touch "$BUS/agents.tsv"
+# 上锁,避免多个 agent 同时启动时并发改 agents.tsv 丢条目
+(
+  flock 9
+  tmpf="$BUS/agents.tsv.tmp.$$"
+  # 删掉同名 id 或同一个 pane 的旧记录,再写新的(幂等)。用 awk 字面比较,避免
+  # grep 正则把 id/target 里的 . [ ( 等当元字符(会误删甚至清空地址簿)
+  awk -F'\t' -v id="$id" -v tg="$target" '$1!=id && $2!=tg' "$BUS/agents.tsv" > "$tmpf" 2>/dev/null || true
+  printf '%s\t%s\t%s\n' "$id" "$target" "$(date -Iseconds)" >> "$tmpf"
+  mv "$tmpf" "$BUS/agents.tsv"
+) 9>>"$BUS/agents.tsv.lock"
+touch "$BUS/inbox/$id.jsonl"
+[ -f "$BUS/state/$id.pos" ] || echo 0 > "$BUS/state/$id.pos"
+echo "已登记: $id -> $target"

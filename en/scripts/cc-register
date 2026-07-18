@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# cc-register <id>  Register the "current tmux pane" as the address for agent <id>
+set -euo pipefail
+BUS="${CC_BUS_HOME:-$HOME/.cc-bus}"
+SELFDIR=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+# With no argument, auto-claim identity from tmux (cc-whoami); if not in tmux/no identity, silently skip registration (not a bus member)
+if [ -n "${1:-}" ]; then id="$1"; else id=$("$SELFDIR/cc-whoami") || exit 0; fi
+# id gets embedded into file paths, so validate against a whitelist to prevent path traversal
+case "$id" in *[!A-Za-z0-9_-]*|'') echo "cc-register: invalid/empty id '$id'" >&2; exit 2;; esac
+mkdir -p "$BUS/inbox" "$BUS/state" "$BUS/log"
+if [ -z "${TMUX_PANE:-}" ]; then
+  echo "cc-register: not inside tmux (TMUX_PANE is empty), cannot register address" >&2
+  exit 1
+fi
+target=$(tmux display-message -p -t "$TMUX_PANE" '#{session_name}:#{window_index}.#{pane_index}')
+touch "$BUS/agents.tsv"
+# Acquire a lock to avoid losing entries when multiple agents start concurrently and modify agents.tsv at the same time
+(
+  flock 9
+  tmpf="$BUS/agents.tsv.tmp.$$"
+  # Remove old records with the same id or the same pane, then write the new one (idempotent). Use awk literal comparison to avoid
+  # grep regex treating . [ ( etc. in id/target as metacharacters (which could wrongly delete or even wipe out the roster)
+  awk -F'\t' -v id="$id" -v tg="$target" '$1!=id && $2!=tg' "$BUS/agents.tsv" > "$tmpf" 2>/dev/null || true
+  printf '%s\t%s\t%s\n' "$id" "$target" "$(date -Iseconds)" >> "$tmpf"
+  mv "$tmpf" "$BUS/agents.tsv"
+) 9>>"$BUS/agents.tsv.lock"
+touch "$BUS/inbox/$id.jsonl"
+[ -f "$BUS/state/$id.pos" ] || echo 0 > "$BUS/state/$id.pos"
+echo "Registered: $id -> $target"

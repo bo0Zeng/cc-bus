@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# cc-send <to> <message...>  Assemble envelope v2 -> atomically enqueue -> handed to cc-busd (if not running, source the lib in place and run the pipeline as inline fallback)
+set -euo pipefail
+BUS="${CC_BUS_HOME:-$HOME/.cc-bus}"
+SELFDIR=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)   # Resolve symlinks so the lib in the same dir can always be found
+# shellcheck source=cc-bus-lib.sh
+. "$SELFDIR/cc-bus-lib.sh"
+
+new_chain=0; msg_class="direct"
+while true; do
+  case "${1:-}" in
+    --new)       new_chain=1; shift;;                    # Force a new causal chain (new topic)
+    --broadcast) msg_class="broadcast"; new_chain=1; shift;;  # Broadcast: mark class + don't chain onto a causal chain
+    --)          shift; break;;                          # Explicit end-of-flags marker (anything after, even --xx, is treated as the recipient)
+    *) break;;
+  esac
+done
+to="${1:?usage: cc-send [--new|--broadcast] <to> <message...>}"; shift
+# The recipient id gets embedded into the file path; whitelist-validate it to prevent path traversal
+case "$to" in *[!A-Za-z0-9_-]*|'') echo "cc-send: invalid recipient '$to' ([A-Za-z0-9_-] only)" >&2; exit 2;; esac
+text="$*"
+from=$("$SELFDIR/cc-whoami" 2>/dev/null || echo unknown)   # Identity is auto-claimed from tmux
+mkdir -p "$BUS/inbox" "$BUS/state" "$BUS/log" "$BUS/queue"
+route_load_config
+
+ts=$(date -Iseconds)
+id="${from}-$(date +%s%N)-${RANDOM}"
+# Causal chain auto-continuation: if from has recently read a message from to (lastread exists and id != -), treat this message as a reply
+irt=""; trace="$from"; hops=0
+lr="$BUS/state/lastread-${from}__${to}"
+if [ "$new_chain" = 0 ] && [ -f "$lr" ]; then
+  IFS=$'\t' read -r p_id p_hops p_trace < "$lr" 2>/dev/null || true
+  if [ -n "${p_id:-}" ] && [ "$p_id" != "-" ]; then
+    irt="$p_id"
+    if [[ "${p_hops:-}" =~ ^[0-9]+$ ]]; then hops=$((p_hops+1)); else hops=1; fi
+    trace="${p_trace:+$p_trace,}$from"   # If p_trace is corrupted/empty, fall back to a single element instead of producing from,from
+  fi
+fi
+env=$(jq -cn --arg id "$id" --arg from "$from" --arg to "$to" --arg ts "$ts" \
+   --arg text "$text" --arg class "$msg_class" --arg irt "$irt" \
+   --arg trace "$trace" --argjson hops "$hops" \
+   '{id:$id,from:$from,to:$to,ts:$ts,text:$text,class:$class,in_reply_to:(if $irt=="" then null else $irt end),trace:$trace,hops:$hops,prio:0}')
+
+# Atomic enqueue. File name uses nanoseconds, giving F04's ordered consumption finer time resolution
+seq="$$-$RANDOM"
+qf="$BUS/queue/$(date +%s%N)-$seq.json"
+tmpq="$BUS/queue/.tmp.$seq"
+printf '%s\n' "$env" > "$tmpq"
+mv "$tmpq" "$qf"
+
+if daemon_running; then
+  echo "enqueued (handled by cc-busd) -> $to"
+else
+  # Fallback: claim the file with a [dot prefix] (dodges the daemon's top-level queue scan, preventing double delivery), then run the pipeline in place once the atomic rename has claimed it
+  proc="$BUS/queue/.proc.$$.${qf##*/}"
+  if mv "$qf" "$proc" 2>/dev/null; then
+    set +e; route_process "$(cat "$proc")"; rc=$?; set -e
+    case "$rc" in
+      0)  rm -f "$proc"; echo "delivered (fallback: cc-busd not running) -> $to";;
+      10) rm -f "$proc"; echo "blocked by routing layer (see bus.log) -> $to" >&2; exit 3;;
+      *)  mv "$proc" "$qf" 2>/dev/null || true
+          echo "cc-send: processing failed, returned to queue (retryable) -> $to" >&2; exit 1;;
+    esac
+  else
+    echo "enqueued (claimed by cc-busd first) -> $to"
+  fi
+fi

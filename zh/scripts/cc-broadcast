@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# cc-broadcast <消息...>  向所有已登记 agent(除自己)广播。
+# 实现=循环调 cc-send --broadcast,因此【自动继承整条路由管线】(ACL/限流/去抖/队列/daemon),不绕过。
+set -euo pipefail
+BUS="${CC_BUS_HOME:-$HOME/.cc-bus}"
+SELFDIR=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+msg="${*:?用法: cc-broadcast <消息...>}"
+from=$("$SELFDIR/cc-whoami" 2>/dev/null || echo unknown)   # 身份走 cc-whoami,与 cc-send 一致(否则"跳过自己"失效)
+[ -f "$BUS/agents.tsv" ] || { echo "cc-broadcast: 还没有已登记的 agent" >&2; exit 0; }
+
+n=0; skipped=0
+while IFS=$'\t' read -r id target ts; do
+  [ -n "${id:-}" ] || continue
+  if [ "$id" = "$from" ]; then continue; fi           # 不发给自己
+  if "$SELFDIR/cc-send" --broadcast -- "$id" "$msg" >/dev/null 2>&1; then
+    n=$((n+1))
+  else
+    skipped=$((skipped+1))                             # 兜底态被 ACL/限流拒
+  fi
+done < <(sort -u -t"$(printf '\t')" -k1,1 "$BUS/agents.tsv")
+
+# 注:daemon 在跑时 cc-send 只入队即返回,n=已发出数;最终投递以 bus.log 为准(拒投会记 REJECT/THROTTLE)
+if [ "$skipped" -gt 0 ]; then
+  echo "已向 $n 个 agent 发出广播(另 $skipped 个被路由层拦截,见 bus.log):$msg"
+else
+  echo "已向 $n 个 agent 发出广播:$msg"
+fi

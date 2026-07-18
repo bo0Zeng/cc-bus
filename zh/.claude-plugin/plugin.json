@@ -1,0 +1,17 @@
+{
+  "name": "cc-bus",
+  "version": "0.1.0",
+  "description": "让 tmux 里多个各自独立的 Claude Code 实例互发消息、接力、广播、并在指定目录派生协作会话的消息总线;带智能路由(ACL/限流/去重/灭环/敲门去抖)、可选 broker 守护进程与就地兜底。",
+  "author": {
+    "name": "zbl"
+  },
+  "license": "MIT",
+  "keywords": [
+    "claude-code",
+    "multi-agent",
+    "tmux",
+    "message-bus",
+    "cc-bus",
+    "agent-communication"
+  ]
+}

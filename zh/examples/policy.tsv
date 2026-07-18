@@ -1,0 +1,10 @@
+# cc-bus ACL 策略示例 —— 复制到 ~/.cc-bus/policy.tsv,并把 config 里 CCBUS_POLICY_MODE 设 on 才生效。
+# 每行:  <from-glob><TAB><允许的 to-glob,逗号分隔>
+# 首个匹配 from 的规则生效;# 开头是注释;列间用真实 TAB 分隔。
+#
+# 星形拓扑示例:worker* 只能发 coordinator,coordinator 可发所有,其它互不可达。
+# worker*	coordinator
+# coordinator	*
+#
+# 全放行(等同 POLICY_MODE=off):
+# *	*

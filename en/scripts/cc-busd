@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# cc-busd — cc-bus broker daemon. Consumes queue/, calls route_process to apply policy + deliver + debounced knock.
+# Usage: cc-busd start|stop|status|run
+#   run    Run the daemon loop in the foreground (systemd ExecStart / manual foreground invocation)
+#   start  Start in the background (setsid nohup)
+#   stop   Stop (kill the process in the pidfile)
+#   status Show running state + queue depth
+# Note: [No set -e] — the daemon loop must stay resilient, and route_process relies on internal &&/|| short-circuiting (ledger constraints).
+set -uo pipefail
+BUS="${CC_BUS_HOME:-$HOME/.cc-bus}"
+SELFDIR=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+# shellcheck source=cc-bus-lib.sh
+. "$SELFDIR/cc-bus-lib.sh"
+
+LOCK="$BUS/cc-busd.lock"
+PIDF="$BUS/cc-busd.pid"
+BUSDLOG="$BUS/log/busd.log"
+REAP_AGE="${CCBUS_REAP_AGE:-60}"      # orphan timeout in seconds
+POLL="${CCBUS_POLL:-0.5}"            # poll interval in seconds when the queue is empty (this implementation always polls, does not use inotify)
+
+blog(){ printf '[%s] %s\n' "$(date -Iseconds)" "$*" >> "$BUSDLOG" 2>/dev/null || true; }
+
+declare -A RETRIES                            # per-message delivery-failure retry count (within this daemon's lifetime)
+MAX_RETRY="${CCBUS_MAX_RETRY:-5}"
+
+# Claim and process one queue file. Returns 0=progress made (consumed/dead-lettered/stolen), 1=no progress (requeued for retry).
+process_one(){
+  local qf="$1" name proc line rc n
+  name="${qf##*/}"
+  proc="$BUS/queue/.proc.$$.$name"           # dot-prefix + this daemon's pid
+  mv "$qf" "$proc" 2>/dev/null || return 0    # failed to claim it (already claimed by someone else), count as processed
+  line=$(cat "$proc" 2>/dev/null || true)
+  route_process "$line"; rc=$?                # no set -e, route_process's &&/|| is safe
+  case "$rc" in
+    0|10) rm -f "$proc"; unset 'RETRIES[$name]' 2>/dev/null; return 0;;   # delivered/rejected/malformed: consumed
+    *)    n=$(( ${RETRIES[$name]:-0} + 1 )); RETRIES[$name]=$n
+          if [ "$n" -ge "$MAX_RETRY" ]; then
+            mv "$proc" "$BUS/queue/.dead.$name" 2>/dev/null || rm -f "$proc"   # dead-letter (dot-prefix, no longer consumed)
+            blog "deadletter $name after $n tries rc=$rc"; unset 'RETRIES[$name]' 2>/dev/null
+            return 0                          # terminal, counts as progress
+          fi
+          mv "$proc" "$BUS/queue/$name" 2>/dev/null || rm -f "$proc"  # requeue for retry
+          blog "requeue $name rc=$rc try=$n"
+          return 1;;                          # no progress → triggers main-loop backoff
+  esac
+}
+
+# Orphan reaping: .tmp half-written files (deleted after timeout, safe); .proc.<dead-PID> files requeued (double-delivery prevented by route_process's msg-id idempotency)
+reap(){
+  local f name pid base now mt
+  now=$(date +%s)
+  shopt -s nullglob
+  for f in "$BUS"/queue/.tmp.*; do
+    mt=$(stat -c %Y "$f" 2>/dev/null) || continue
+    [ $(( now - mt )) -ge "$REAP_AGE" ] && { rm -f "$f"; blog "reap tmp ${f##*/}"; }
+  done
+  for f in "$BUS"/queue/.proc.*.json; do
+    name="${f##*/}"
+    pid=$(printf '%s' "$name" | sed -n 's/^\.proc\.\([0-9][0-9]*\)\..*/\1/p')
+    [ -n "$pid" ] || continue
+    kill -0 "$pid" 2>/dev/null && continue      # the claimant is still alive (including this daemon itself), skip
+    mt=$(stat -c %Y "$f" 2>/dev/null) || continue
+    [ $(( now - mt )) -ge "$REAP_AGE" ] || continue
+    base="${name#.proc.$pid.}"
+    mv "$f" "$BUS/queue/$base" 2>/dev/null && blog "reap requeue $base (dead $pid)"
+  done
+  shopt -u nullglob
+}
+
+run_loop(){
+  mkdir -p "$BUS"/{inbox,state,log,queue}
+  exec 200>>"$LOCK"
+  if ! flock -n 200; then echo "cc-busd is already running (could not acquire the lock)" >&2; exit 1; fi
+  echo $$ > "$PIDF"
+  route_load_config
+  local running=1 files sorted qf progressed
+  trap 'running=0' TERM INT
+  blog "start pid=$$"
+  while [ "$running" = 1 ]; do
+    # Hot-reload config: consistent with the fallback path (cc-send re-reads on every send) — config changes take effect immediately, no restart needed.
+    # Unset the routing knobs before re-reading, so that "deleting a key = revert to default" also takes effect.
+    unset CCBUS_NUDGE_DEBOUNCE CCBUS_POLICY_MODE CCBUS_TTL CCBUS_MAX_REVISIT \
+          CCBUS_RATE_PAIR CCBUS_RATE_GLOBAL CCBUS_RATE_WINDOW CCBUS_DEDUP_WINDOW
+    route_load_config
+    reap
+    shopt -s nullglob; files=( "$BUS"/queue/*.json ); shopt -u nullglob
+    if [ "${#files[@]}" -gt 0 ]; then
+      mapfile -t sorted < <(printf '%s\n' "${files[@]}" | LC_ALL=C sort)  # byte order ≈ time order
+      progressed=0
+      for qf in "${sorted[@]}"; do
+        [ "$running" = 1 ] || break
+        process_one "$qf" && progressed=1
+      done
+      [ "$progressed" = 1 ] || sleep "$POLL"   # a whole round with no progress (everything stuck) → back off, avoid busy-waiting burning CPU/log
+    else
+      sleep "$POLL"
+    fi
+  done
+  blog "stop pid=$$"
+  rm -f "$PIDF"
+  flock -u 200 2>/dev/null || true
+}
+
+case "${1:-}" in
+  run) run_loop;;
+  start)
+    if daemon_running; then echo "cc-busd is already running (pid $(cat "$PIDF" 2>/dev/null))"; exit 0; fi
+    mkdir -p "$BUS/log"
+    setsid nohup "$SELFDIR/cc-busd" run >>"$BUSDLOG" 2>&1 </dev/null &
+    for _i in $(seq 1 10); do sleep 0.3; daemon_running && break; done   # poll to confirm, up to ~3s
+    if daemon_running; then echo "cc-busd started (pid $(cat "$PIDF" 2>/dev/null))"
+    else echo "cc-busd failed to start, see $BUSDLOG" >&2; exit 1; fi
+    ;;
+  stop)
+    # Only kill when [liveness via the lock is confirmed true], to avoid mistakenly killing an innocent process whose PID was reused from a stale pidfile
+    if daemon_running; then
+      pid=$(cat "$PIDF" 2>/dev/null || true)
+      if [ -n "$pid" ] && kill "$pid" 2>/dev/null; then echo "cc-busd stopped (pid $pid)"
+      else echo "cc-busd: liveness confirmed but kill failed (pid=$pid), please check manually" >&2; fi
+    else
+      rm -f "$PIDF"
+      echo "cc-busd is not running (stale pidfile cleaned up, no signal mistakenly sent)"
+    fi
+    ;;
+  status)
+    if daemon_running; then
+      echo "cc-busd: running (pid $(cat "$PIDF" 2>/dev/null))"
+      shopt -s nullglob; q=( "$BUS"/queue/*.json ); shopt -u nullglob
+      echo "  queue pending: ${#q[@]}"
+    else echo "cc-busd: not running"; fi
+    ;;
+  *) echo "Usage: cc-busd start|stop|status|run" >&2; exit 2;;
+esac

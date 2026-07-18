@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# cc-list  List registered agents and each one's unread inbox count (see who's online and whether there's a backlog)
+set -euo pipefail
+BUS="${CC_BUS_HOME:-$HOME/.cc-bus}"
+[ -f "$BUS/agents.tsv" ] || { echo "(no agents registered yet)"; exit 0; }
+printf '%-12s %-18s %s\n' ID TMUX UNREAD
+while IFS=$'\t' read -r id target ts; do
+  [ -n "${id:-}" ] || continue
+  inbox="$BUS/inbox/$id.jsonl"; posf="$BUS/state/$id.pos"
+  total=0; pos=0
+  [ -f "$inbox" ] && total=$(awk 'END{print NR}' "$inbox")   # same counting convention as cc-recv (counts even if the last line has no trailing newline)
+  [ -f "$posf" ] && pos=$(cat "$posf" 2>/dev/null || echo 0)
+  printf '%-12s %-18s %s\n' "$id" "$target" "$((total-pos))"
+done < "$BUS/agents.tsv"

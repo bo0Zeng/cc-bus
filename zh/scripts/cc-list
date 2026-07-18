@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# cc-list  列出已登记的 agent 及各自 inbox 待读条数(看谁在线、有没有积压)
+set -euo pipefail
+BUS="${CC_BUS_HOME:-$HOME/.cc-bus}"
+[ -f "$BUS/agents.tsv" ] || { echo "(还没有登记的 agent)"; exit 0; }
+printf '%-12s %-18s %s\n' ID TMUX 待读
+while IFS=$'\t' read -r id target ts; do
+  [ -n "${id:-}" ] || continue
+  inbox="$BUS/inbox/$id.jsonl"; posf="$BUS/state/$id.pos"
+  total=0; pos=0
+  [ -f "$inbox" ] && total=$(awk 'END{print NR}' "$inbox")   # 与 cc-recv 同口径(末行无换行也计)
+  [ -f "$posf" ] && pos=$(cat "$posf" 2>/dev/null || echo 0)
+  printf '%-12s %-18s %s\n' "$id" "$target" "$((total-pos))"
+done < "$BUS/agents.tsv"

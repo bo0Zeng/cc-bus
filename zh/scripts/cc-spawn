@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# cc-spawn <目录> [初始任务...]  在该目录开一个独立 cct(claude)会话、自动上总线、返回其 id。
+# 产物是【独立历史 + 原生读该目录文件】的长驻协作 agent(区别于 subagent:同上下文、一次性)。
+# 收掉用 cc-kill <id>;看它用 tmux attach -t <id>;跟它聊用 cc-send <id> "..."。
+set -euo pipefail
+BUS="${CC_BUS_HOME:-$HOME/.cc-bus}"
+SELFDIR=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+LAUNCH="${CCSPAWN_LAUNCH:-claude}"       # 启动器(默认 claude);可测性钩子:测试时设 mock 命令免起真 claude
+
+new_flag=0
+if [ "${1:-}" = "--new" ]; then new_flag=1; shift; fi   # 强制新建(否则默认复用同目录已有活会话)
+dir="${1:?用法: cc-spawn [--new] <目录> [初始任务...]}"; shift || true
+task="$*"
+
+# 1. 绝对路径 + 校验目录存在
+absdir=$(cd "$dir" 2>/dev/null && pwd) || { echo "cc-spawn: 目录不存在: $dir" >&2; exit 2; }
+
+# 2. 派生会话名 = <basename>_cc(消毒 + strip 首尾 -,与 cc-whoami resolve 对齐)
+bn=$(basename "$absdir")
+base="$(printf '%s' "$bn" | tr -c 'A-Za-z0-9_-' '_' | sed 's/^-*//; s/-*$//')_cc"
+
+# 默认【到就用、没有才建】:该目录已有活会话(且非 --new)→ 复用它,别重复开
+if [ "$new_flag" != 1 ] && tmux has-session -t "=$base" 2>/dev/null; then
+  rpane=$(tmux list-panes -t "$base" -F '#{pane_id}' 2>/dev/null | head -1)
+  [ -n "${rpane:-}" ] && TMUX_PANE="$rpane" "$SELFDIR/cc-register" "$base" >/dev/null 2>&1 || true
+  [ -n "$task" ] && "$SELFDIR/cc-send" "$base" "$task" >/dev/null 2>&1 || true
+  echo "复用已有会话: $base${task:+(已把任务发给它)}"
+  echo "  跟它聊: cc-send $base \"...\"    看它: tmux attach -t $base    要开全新的: 加 --new"
+  exit 0
+fi
+
+# 新建:同名加后缀(= 精确,防前缀误判)
+name="$base"; k=2
+while tmux has-session -t "=$name" 2>/dev/null; do name="$base-$k"; k=$((k+1)); done
+
+# 3. 预信任 ~/.claude.json:【仅当尚未信任】才写(已信任跳过 → 避开绝大多数并发写窗口)
+cj="${CCSPAWN_CLAUDEJSON:-$HOME/.claude.json}"   # 可测性钩子:测试指副本,不碰真主配置
+pretrusted=0
+if [ -f "$cj" ] && command -v jq >/dev/null 2>&1; then
+  if jq -e --arg d "$absdir" '.projects[$d].hasTrustDialogAccepted == true' "$cj" >/dev/null 2>&1; then
+    pretrusted=1
+  else
+    cp -p "$cj" "$cj.bak-ccspawn.$$" 2>/dev/null || true
+    tmpj="$cj.tmp.ccspawn.$$"
+    if jq --arg d "$absdir" '(.projects[$d].hasTrustDialogAccepted) = true' "$cj" > "$tmpj" 2>/dev/null \
+       && jq -e . "$tmpj" >/dev/null 2>&1; then
+      mv "$tmpj" "$cj"; pretrusted=1; rm -f "$cj.bak-ccspawn.$$"
+    else
+      rm -f "$tmpj"; echo "cc-spawn: 预信任写入失败(claude 起来可能弹信任框,已备兜底)" >&2
+    fi
+  fi
+fi
+
+mkdir -p "$BUS"
+# 4. 建 detached 会话,并立刻取【pane id】(刚建精确会话存在,此处裸 -t 安全;之后一律用 pane id,免前缀撞会话)
+tmux new-session -d -s "$name" -c "$absdir" -x 220 -y 50
+pane=$(tmux list-panes -t "$name" -F '#{pane_id}' 2>/dev/null | head -1)
+[ -n "$pane" ] || { echo "cc-spawn: 建会话失败" >&2; exit 1; }
+# 起 LAUNCH[+任务](任务用 %q 安全转义,防注入)
+if [ -n "$task" ]; then
+  tmux send-keys -t "$pane" "$LAUNCH $(printf '%q' "$task")" Enter
+else
+  tmux send-keys -t "$pane" "$LAUNCH" Enter
+fi
+
+# 5. spawn 自己登记(不靠 SessionStart 钩子,保证上总线)
+TMUX_PANE="$pane" "$SELFDIR/cc-register" "$name" >/dev/null 2>&1 || true
+
+# 6. 台账(加锁)
+( flock 9; printf '%s\t%s\t%s\t%s\n' "$name" "$absdir" "$(date -Iseconds)" "${task:-}" >> "$BUS/spawned.tsv" ) 9>>"$BUS/spawned.tsv.lock"
+
+# 7. 信任兜底:仅当预信任【没成功】时才检测信任框回车(成功就不白等、不会被输出里的 "trust" 误触发)
+if [ "$pretrusted" != 1 ]; then
+  for _i in 1 2 3 4 5 6; do
+    sleep 0.5
+    if tmux capture-pane -t "$pane" -p 2>/dev/null | grep -q 'Yes, I trust this folder'; then
+      tmux send-keys -t "$pane" Enter; break
+    fi
+  done
+else
+  sleep 1.5   # 给 claude 一点启动时间(消息落 inbox 不丢,这只是让紧接着的 cc-send 更可能即时被处理)
+fi
+
+echo "已 spawn: $name   (目录: $absdir${task:+  初始任务: $task})"
+echo "  跟它聊: cc-send $name \"...\"    看它: tmux attach -t $name    收掉: cc-kill $name"

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# cc-bus Stop hook: when CC wants to end this turn, drain the inbox first; if there are new messages, block and feed them back to Claude
+set -euo pipefail
+BUS="${CC_BUS_HOME:-$HOME/.cc-bus}"
+SELFDIR=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+cat >/dev/null                     # CC passes JSON via stdin (including stop_hook_active, etc.); not needed here so discard it
+id=$("$SELFDIR/cc-whoami" 2>/dev/null || true)
+[ -n "$id" ] || exit 0             # not in tmux/no identity = not a bus member, pass through directly (zero impact on non-bus sessions)
+msgs=$("$SELFDIR/cc-recv" "$id" 2>/dev/null || true)
+if [ -n "$msgs" ]; then
+  reason="You have new cc-bus messages. Please handle them before ending this turn:
+$msgs"
+  jq -cn --arg r "$reason" '{decision:"block", reason:$r}'   # block the stop and feed the messages back to Claude
+fi
+exit 0

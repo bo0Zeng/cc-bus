@@ -1,0 +1,15 @@
+[Unit]
+Description=cc-bus broker daemon (multi Claude Code 实例消息总线路由)
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/cc-busd run
+Restart=on-failure
+RestartSec=2
+# 如需自定义运行时根/旋钮,取消注释:
+# Environment=CC_BUS_HOME=%h/.cc-bus
+# Environment=CCBUS_POLL=0.5
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# cc-recv [id]  读取本 agent 自上次以来的新消息,并推进"已读位置"(唯一消费入口)
+set -euo pipefail
+BUS="${CC_BUS_HOME:-$HOME/.cc-bus}"
+SELFDIR=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+if [ -n "${1:-}" ]; then id="$1"; else id=$("$SELFDIR/cc-whoami"); fi   # 无参则自动认领身份
+case "$id" in *[!A-Za-z0-9_-]*|'') echo "cc-recv: 非法/空 id '$id'" >&2; exit 2;; esac
+inbox="$BUS/inbox/$id.jsonl"
+posf="$BUS/state/$id.pos"
+[ -f "$inbox" ] || exit 0
+(
+  flock 9
+  # 用 awk 计行数:把"末行无结尾换行"也计入,与下面 sed 取行范围口径一致
+  total=$(awk 'END{print NR}' "$inbox")
+  pos=$(cat "$posf" 2>/dev/null || echo 0)
+  [[ "$pos" =~ ^[0-9]+$ ]] || pos=0          # pos 被截断/损坏时归零自愈,别静默失效
+  [ "$pos" -le "$total" ] || pos=0           # inbox 被外部清空/截短而 pos 仍高 → 归零,别永远收不到
+  if [ "$total" -gt "$pos" ]; then
+    new=$(sed -n "$((pos+1)),\$p" "$inbox")
+    # 显示:fromjson? 跳过非法 JSON 坏行(防毒丸卡死),// 默认容忍 v1 缺字段行
+    printf '%s\n' "$new" \
+      | jq -Rr 'fromjson? // empty | "【cc-bus 来自 \(.from // "?") @ \(.ts // "?") (\(.id // "-"))】\n\(.text // "")\n(回复用: cc-send \(.from // "?") \"…\")\n"'
+    # 逐条记录 lastread-<self>__<from>=id\thops\ttrace(供 F03 因果链);坏行/非法 from 跳过
+    printf '%s\n' "$new" | while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      obj=$(printf '%s' "$line" | jq -Rc 'fromjson? // empty')
+      [ -n "$obj" ] || continue              # 非法 JSON 行跳过
+      f=$(printf '%s' "$obj" | jq -r '.from // "?"')
+      case "$f" in *[!A-Za-z0-9_-]*|'') continue;; esac   # 非法发件人不写路径
+      mid=$(printf '%s' "$obj" | jq -r '.id // "-"')
+      hp=$(printf '%s' "$obj" | jq -r '.hops // 0')
+      tr=$(printf '%s' "$obj" | jq -r '.trace // .from // "?"')
+      lrf="$BUS/state/lastread-${id}__${f}"    # 原子写(tmp+mv),避免 cc-send 读侧无锁读到半截
+      printf '%s\t%s\t%s\n' "$mid" "$hp" "$tr" > "$lrf.tmp.$$" && mv "$lrf.tmp.$$" "$lrf"
+    done
+    echo "$total" > "$posf"
+  fi
+) 9>>"$inbox.lock"

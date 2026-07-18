@@ -1,0 +1,25 @@
+{
+  "description": "cc-bus: 会话启动自动登记上总线(SessionStart)+ 结束前排空 inbox 收信、有新消息则拦下处理(Stop)。装了 plugin 即自动接管这两个钩子,无需手动改 settings.json。",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/cc-register\" >/dev/null 2>&1 || true"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/cc-bus-stop-hook\""
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,27 @@
+# cc-bus 配置示例 —— 复制到 ~/.cc-bus/config 并按需改。全部键都有内置默认,
+# 缺文件/缺键 = 用默认(且 POLICY_MODE 默 off = 全放行,行为等同无路由层)。
+# 这是 sourceable 的 KEY=VAL,不要写引号外的空格。
+
+# —— F02 ——
+CCBUS_NUDGE_DEBOUNCE=2      # 同一收件人两次敲门最小间隔秒
+CCBUS_POLICY_MODE=off       # off=全放行;on=按 ~/.cc-bus/policy.tsv 强制 ACL
+
+# —— F03(反噪声阀门,全部 opt-in,默认 0=关)——
+# CCBUS_RATE_PAIR=0         # 每 (from,to) 每窗口最大条数,0=不限
+# CCBUS_RATE_GLOBAL=0       # 全局每窗口最大条数(熔断),0=不限
+# CCBUS_RATE_WINDOW=60      # 限流窗口秒
+# CCBUS_DEDUP_WINDOW=0      # 同 from+text 去重窗口秒,0=不去重
+# CCBUS_TTL=0               # 因果链最大跳数,超则丢,0=不限
+# CCBUS_MAX_REVISIT=0       # to 在 trace 出现达此次数判成环,0=不判
+#
+# —— 推荐:反 storm 首选限流(storm 高频/对话慢速可干净区分)——
+#   CCBUS_RATE_PAIR=12       # 同一对话最多 12 条/分钟,足够正常来回、挡住失控回环
+#   CCBUS_RATE_GLOBAL=60     # 全网 60 条/分钟熔断
+# 灭环(TTL/MAX_REVISIT)是可选粗兜底,无法区分长对话 vs 回环,要设就设生成(如 TTL=30)。
+#
+# 改本文件即时生效:cc-send 兜底每发即读;cc-busd 守护进程每轮热加载(无需重启)。
+#
+# 注:cc-busd 自身三个旋钮是【env-only】(写这里无效),需经环境变量 / systemd Environment= 设:
+#   CCBUS_POLL=0.5       守护进程队列空时轮询间隔秒
+#   CCBUS_REAP_AGE=60    孤儿(.tmp/.proc)回收超时秒
+#   CCBUS_MAX_RETRY=5    投递失败重试上限,超则转死信 .dead.*

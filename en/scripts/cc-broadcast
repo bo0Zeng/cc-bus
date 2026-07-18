@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# cc-broadcast <message...>  Broadcast to all registered agents (except self).
+# Implementation = loop calling cc-send --broadcast, so it [automatically inherits the entire routing pipeline] (ACL/rate-limit/debounce/queue/daemon) without bypassing it.
+set -euo pipefail
+BUS="${CC_BUS_HOME:-$HOME/.cc-bus}"
+SELFDIR=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+msg="${*:?usage: cc-broadcast <message...>}"
+from=$("$SELFDIR/cc-whoami" 2>/dev/null || echo unknown)   # Identity goes through cc-whoami, matching cc-send (otherwise "skip self" would fail)
+[ -f "$BUS/agents.tsv" ] || { echo "cc-broadcast: no registered agents yet" >&2; exit 0; }
+
+n=0; skipped=0
+while IFS=$'\t' read -r id target ts; do
+  [ -n "${id:-}" ] || continue
+  if [ "$id" = "$from" ]; then continue; fi           # Don't send to self
+  if "$SELFDIR/cc-send" --broadcast -- "$id" "$msg" >/dev/null 2>&1; then
+    n=$((n+1))
+  else
+    skipped=$((skipped+1))                             # Rejected by ACL/rate-limit in the fallback path
+  fi
+done < <(sort -u -t"$(printf '\t')" -k1,1 "$BUS/agents.tsv")
+
+# Note: while the daemon is running, cc-send only enqueues and returns immediately; n=number sent; final delivery is authoritative in bus.log (rejected deliveries are logged as REJECT/THROTTLE)
+if [ "$skipped" -gt 0 ]; then
+  echo "broadcast sent to $n agent(s) ($skipped blocked by routing layer, see bus.log): $msg"
+else
+  echo "broadcast sent to $n agent(s): $msg"
+fi

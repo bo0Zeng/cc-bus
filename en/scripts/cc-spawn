@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# cc-spawn <dir> [initial task...]  Start a standalone cct(claude) session in that dir, auto-join the bus, print its id.
+# The result is a long-running collaborator agent with independent history + native access to files in that dir (vs. subagent: same context, one-shot).
+# Kill it with cc-kill <id>; watch it with tmux attach -t <id>; talk to it with cc-send <id> "...".
+set -euo pipefail
+BUS="${CC_BUS_HOME:-$HOME/.cc-bus}"
+SELFDIR=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+LAUNCH="${CCSPAWN_LAUNCH:-claude}"       # launcher (default: claude); testability hook: set a mock command in tests to avoid starting a real claude
+
+new_flag=0
+if [ "${1:-}" = "--new" ]; then new_flag=1; shift; fi   # force a new session (otherwise reuse an existing live session in the same dir by default)
+dir="${1:?Usage: cc-spawn [--new] <dir> [initial task...]}"; shift || true
+task="$*"
+
+# 1. Absolute path + verify the dir exists
+absdir=$(cd "$dir" 2>/dev/null && pwd) || { echo "cc-spawn: directory does not exist: $dir" >&2; exit 2; }
+
+# 2. Derive session name = <basename>_cc (sanitize + strip leading/trailing -, aligned with cc-whoami resolve)
+bn=$(basename "$absdir")
+base="$(printf '%s' "$bn" | tr -c 'A-Za-z0-9_-' '_' | sed 's/^-*//; s/-*$//')_cc"
+
+# Default is "reuse if present, create only if absent": if the dir already has a live session (and not --new) → reuse it instead of opening a duplicate
+if [ "$new_flag" != 1 ] && tmux has-session -t "=$base" 2>/dev/null; then
+  rpane=$(tmux list-panes -t "$base" -F '#{pane_id}' 2>/dev/null | head -1)
+  [ -n "${rpane:-}" ] && TMUX_PANE="$rpane" "$SELFDIR/cc-register" "$base" >/dev/null 2>&1 || true
+  [ -n "$task" ] && "$SELFDIR/cc-send" "$base" "$task" >/dev/null 2>&1 || true
+  echo "Reusing existing session: $base${task:+(task sent to it)}"
+  echo "  Talk to it: cc-send $base \"...\"    Watch it: tmux attach -t $base    Want a fresh one: add --new"
+  exit 0
+fi
+
+# New session: append a suffix on name clash (exact match, avoids prefix mis-detection)
+name="$base"; k=2
+while tmux has-session -t "=$name" 2>/dev/null; do name="$base-$k"; k=$((k+1)); done
+
+# 3. Pre-trust ~/.claude.json: write only when not already trusted (skip if already trusted → avoids most of the concurrent-write window)
+cj="${CCSPAWN_CLAUDEJSON:-$HOME/.claude.json}"   # testability hook: tests point this at a copy, never touches the real main config
+pretrusted=0
+if [ -f "$cj" ] && command -v jq >/dev/null 2>&1; then
+  if jq -e --arg d "$absdir" '.projects[$d].hasTrustDialogAccepted == true' "$cj" >/dev/null 2>&1; then
+    pretrusted=1
+  else
+    cp -p "$cj" "$cj.bak-ccspawn.$$" 2>/dev/null || true
+    tmpj="$cj.tmp.ccspawn.$$"
+    if jq --arg d "$absdir" '(.projects[$d].hasTrustDialogAccepted) = true' "$cj" > "$tmpj" 2>/dev/null \
+       && jq -e . "$tmpj" >/dev/null 2>&1; then
+      mv "$tmpj" "$cj"; pretrusted=1; rm -f "$cj.bak-ccspawn.$$"
+    else
+      rm -f "$tmpj"; echo "cc-spawn: pre-trust write failed (claude may show the trust dialog on startup; fallback is in place)" >&2
+    fi
+  fi
+fi
+
+mkdir -p "$BUS"
+# 4. Create a detached session and immediately grab the pane id (right after creation the exact session is guaranteed to exist, so a bare -t here is safe; from here on always use the pane id to avoid prefix collisions with other sessions)
+tmux new-session -d -s "$name" -c "$absdir" -x 220 -y 50
+pane=$(tmux list-panes -t "$name" -F '#{pane_id}' 2>/dev/null | head -1)
+[ -n "$pane" ] || { echo "cc-spawn: failed to create session" >&2; exit 1; }
+# Launch LAUNCH [+ task] (task is escaped with %q for safety, prevents injection)
+if [ -n "$task" ]; then
+  tmux send-keys -t "$pane" "$LAUNCH $(printf '%q' "$task")" Enter
+else
+  tmux send-keys -t "$pane" "$LAUNCH" Enter
+fi
+
+# 5. Register the spawn itself (doesn't rely on the SessionStart hook, guarantees it lands on the bus)
+TMUX_PANE="$pane" "$SELFDIR/cc-register" "$name" >/dev/null 2>&1 || true
+
+# 6. Ledger (with lock)
+( flock 9; printf '%s\t%s\t%s\t%s\n' "$name" "$absdir" "$(date -Iseconds)" "${task:-}" >> "$BUS/spawned.tsv" ) 9>>"$BUS/spawned.tsv.lock"
+
+# 7. Trust-dialog fallback: only probe for the trust-dialog Enter when pre-trust did NOT succeed (if it succeeded, no need to wait, and it won't be falsely triggered by the word "trust" appearing in other output)
+if [ "$pretrusted" != 1 ]; then
+  for _i in 1 2 3 4 5 6; do
+    sleep 0.5
+    if tmux capture-pane -t "$pane" -p 2>/dev/null | grep -q 'Yes, I trust this folder'; then
+      tmux send-keys -t "$pane" Enter; break
+    fi
+  done
+else
+  sleep 1.5   # give claude a bit of startup time (messages landing in the inbox aren't lost either way; this just makes it more likely a cc-send right after this gets handled immediately)
+fi
+
+echo "Spawned: $name   (dir: $absdir${task:+  initial task: $task})"
+echo "  Talk to it: cc-send $name \"...\"    Watch it: tmux attach -t $name    Kill it: cc-kill $name"

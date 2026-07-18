@@ -1,0 +1,25 @@
+{
+  "description": "cc-bus: auto-register on the bus at session start (SessionStart) + drain the inbox before the turn ends and block to handle any new messages (Stop). Installing the plugin takes over both hooks automatically, no manual settings.json edits needed.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/cc-register\" >/dev/null 2>&1 || true"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/cc-bus-stop-hook\""
+          }
+        ]
+      }
+    ]
+  }
+}

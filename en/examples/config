@@ -1,0 +1,32 @@
+# cc-bus config example — copy to ~/.cc-bus/config and edit as needed. Every key has a
+# built-in default; a missing file/key = use the default (and POLICY_MODE defaults to off =
+# pass everything, behaves as if there were no routing layer).
+# This is a sourceable KEY=VAL — no spaces outside quotes.
+
+# —— core ——
+CCBUS_NUDGE_DEBOUNCE=2      # minimum seconds between two knocks to the same recipient
+CCBUS_POLICY_MODE=off       # off=pass everything; on=enforce ACL per ~/.cc-bus/policy.tsv
+
+# —— anti-noise valves (all opt-in, default 0=off) ——
+# CCBUS_RATE_PAIR=0         # max messages per (from,to) per window, 0=unlimited
+# CCBUS_RATE_GLOBAL=0       # max messages globally per window (breaker), 0=unlimited
+# CCBUS_RATE_WINDOW=60      # rate-limit window in seconds
+# CCBUS_DEDUP_WINDOW=0      # dedup window in seconds for same from+text, 0=no dedup
+# CCBUS_TTL=0               # max hops on the causal chain, dropped beyond, 0=unlimited
+# CCBUS_MAX_REVISIT=0       # treat as a loop once `to` appears this many times in trace, 0=off
+#
+# —— recommended: rate-limit is the first choice against storms (cleanly separates a
+#    high-frequency storm from a slow conversation) ——
+#   CCBUS_RATE_PAIR=12       # at most 12 msgs/min per conversation, enough for normal back-and-forth, blocks runaway loops
+#   CCBUS_RATE_GLOBAL=60     # global breaker at 60 msgs/min
+# Loop-cut (TTL/MAX_REVISIT) is an optional coarse backstop that can't tell a long conversation
+# from a loop; if you set it, set it generously (e.g. TTL=30).
+#
+# Editing this file takes effect immediately: the cc-send fallback reads it on each send;
+# the cc-busd daemon hot-reloads it each round (no restart).
+#
+# Note: cc-busd's own three knobs are env-only (setting them here has no effect); set them via
+# environment variables / systemd Environment=:
+#   CCBUS_POLL=0.5       daemon poll interval in seconds when the queue is empty
+#   CCBUS_REAP_AGE=60    orphan (.tmp/.proc) reclaim timeout in seconds
+#   CCBUS_MAX_RETRY=5    delivery retry limit, moved to dead-letter .dead.* beyond it

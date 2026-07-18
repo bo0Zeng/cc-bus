@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# cc-busd — cc-bus broker 守护进程。消费 queue/,调 route_process 施策+投递+去抖敲门。
+# 用法: cc-busd start|stop|status|run
+#   run    前台跑守护循环(systemd ExecStart / 手动前台调这个)
+#   start  后台起(setsid nohup)
+#   stop   停(kill pidfile 里的进程)
+#   status 看运行状态 + 队列深度
+# 注意:【不用 set -e】——守护循环要韧,且 route_process 内有 &&/|| 短路(账本约束)。
+set -uo pipefail
+BUS="${CC_BUS_HOME:-$HOME/.cc-bus}"
+SELFDIR=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+# shellcheck source=cc-bus-lib.sh
+. "$SELFDIR/cc-bus-lib.sh"
+
+LOCK="$BUS/cc-busd.lock"
+PIDF="$BUS/cc-busd.pid"
+BUSDLOG="$BUS/log/busd.log"
+REAP_AGE="${CCBUS_REAP_AGE:-60}"      # 孤儿超时秒
+POLL="${CCBUS_POLL:-0.5}"            # 队列空时轮询间隔秒(本实现恒轮询,未用 inotify)
+
+blog(){ printf '[%s] %s\n' "$(date -Iseconds)" "$*" >> "$BUSDLOG" 2>/dev/null || true; }
+
+declare -A RETRIES                            # 每条消息的投递失败重试计数(daemon 生命周期内)
+MAX_RETRY="${CCBUS_MAX_RETRY:-5}"
+
+# 认领并处理一条队列文件。返回 0=有进展(消费/死信/被抢),1=无进展(退回重试)。
+process_one(){
+  local qf="$1" name proc line rc n
+  name="${qf##*/}"
+  proc="$BUS/queue/.proc.$$.$name"           # 点前缀 + 本 daemon pid
+  mv "$qf" "$proc" 2>/dev/null || return 0    # 没抢到(已被别人认领),算已处理
+  line=$(cat "$proc" 2>/dev/null || true)
+  route_process "$line"; rc=$?                # 无 set -e,route_process 的 &&/|| 安全
+  case "$rc" in
+    0|10) rm -f "$proc"; unset 'RETRIES[$name]' 2>/dev/null; return 0;;   # 已投递/已拒/坏:消费
+    *)    n=$(( ${RETRIES[$name]:-0} + 1 )); RETRIES[$name]=$n
+          if [ "$n" -ge "$MAX_RETRY" ]; then
+            mv "$proc" "$BUS/queue/.dead.$name" 2>/dev/null || rm -f "$proc"   # 死信(点前缀,不再消费)
+            blog "deadletter $name after $n tries rc=$rc"; unset 'RETRIES[$name]' 2>/dev/null
+            return 0                          # 已终结,算进展
+          fi
+          mv "$proc" "$BUS/queue/$name" 2>/dev/null || rm -f "$proc"  # 退回重试
+          blog "requeue $name rc=$rc try=$n"
+          return 1;;                          # 无进展 → 触发主循环退避
+  esac
+}
+
+# 孤儿回收:.tmp 半写入(超时删,安全);.proc.<死PID> 退回队列(靠 route_process 的 msg-id 幂等防双投)
+reap(){
+  local f name pid base now mt
+  now=$(date +%s)
+  shopt -s nullglob
+  for f in "$BUS"/queue/.tmp.*; do
+    mt=$(stat -c %Y "$f" 2>/dev/null) || continue
+    [ $(( now - mt )) -ge "$REAP_AGE" ] && { rm -f "$f"; blog "reap tmp ${f##*/}"; }
+  done
+  for f in "$BUS"/queue/.proc.*.json; do
+    name="${f##*/}"
+    pid=$(printf '%s' "$name" | sed -n 's/^\.proc\.\([0-9][0-9]*\)\..*/\1/p')
+    [ -n "$pid" ] || continue
+    kill -0 "$pid" 2>/dev/null && continue      # 认领者还活着(含本 daemon 自己),跳过
+    mt=$(stat -c %Y "$f" 2>/dev/null) || continue
+    [ $(( now - mt )) -ge "$REAP_AGE" ] || continue
+    base="${name#.proc.$pid.}"
+    mv "$f" "$BUS/queue/$base" 2>/dev/null && blog "reap requeue $base (dead $pid)"
+  done
+  shopt -u nullglob
+}
+
+run_loop(){
+  mkdir -p "$BUS"/{inbox,state,log,queue}
+  exec 200>>"$LOCK"
+  if ! flock -n 200; then echo "cc-busd 已在运行(拿不到锁)" >&2; exit 1; fi
+  echo $$ > "$PIDF"
+  route_load_config
+  local running=1 files sorted qf progressed
+  trap 'running=0' TERM INT
+  blog "start pid=$$"
+  while [ "$running" = 1 ]; do
+    # 热加载 config:与兜底路径(cc-send 每发即读)行为一致——改 config 即时生效,不用重启。
+    # 先 unset 路由旋钮再重读,确保"删掉某键=回默认"也能生效。
+    unset CCBUS_NUDGE_DEBOUNCE CCBUS_POLICY_MODE CCBUS_TTL CCBUS_MAX_REVISIT \
+          CCBUS_RATE_PAIR CCBUS_RATE_GLOBAL CCBUS_RATE_WINDOW CCBUS_DEDUP_WINDOW
+    route_load_config
+    reap
+    shopt -s nullglob; files=( "$BUS"/queue/*.json ); shopt -u nullglob
+    if [ "${#files[@]}" -gt 0 ]; then
+      mapfile -t sorted < <(printf '%s\n' "${files[@]}" | LC_ALL=C sort)  # 字节序≈时间序
+      progressed=0
+      for qf in "${sorted[@]}"; do
+        [ "$running" = 1 ] || break
+        process_one "$qf" && progressed=1
+      done
+      [ "$progressed" = 1 ] || sleep "$POLL"   # 一整轮都没进展(全卡)→ 退避,别忙等烧 CPU/日志
+    else
+      sleep "$POLL"
+    fi
+  done
+  blog "stop pid=$$"
+  rm -f "$PIDF"
+  flock -u 200 2>/dev/null || true
+}
+
+case "${1:-}" in
+  run) run_loop;;
+  start)
+    if daemon_running; then echo "cc-busd 已在运行(pid $(cat "$PIDF" 2>/dev/null))"; exit 0; fi
+    mkdir -p "$BUS/log"
+    setsid nohup "$SELFDIR/cc-busd" run >>"$BUSDLOG" 2>&1 </dev/null &
+    for _i in $(seq 1 10); do sleep 0.3; daemon_running && break; done   # 轮询确认最多 ~3s
+    if daemon_running; then echo "cc-busd 已启动(pid $(cat "$PIDF" 2>/dev/null))"
+    else echo "cc-busd 启动失败,见 $BUSDLOG" >&2; exit 1; fi
+    ;;
+  stop)
+    # 只在【锁判活为真】时才 kill,避免 stale pidfile 的 PID 被复用后误杀无辜进程
+    if daemon_running; then
+      pid=$(cat "$PIDF" 2>/dev/null || true)
+      if [ -n "$pid" ] && kill "$pid" 2>/dev/null; then echo "已停 cc-busd(pid $pid)"
+      else echo "cc-busd: 判活为真但无法 kill(pid=$pid),请手动检查" >&2; fi
+    else
+      rm -f "$PIDF"
+      echo "cc-busd 未在运行(已清理残留 pidfile,未误发信号)"
+    fi
+    ;;
+  status)
+    if daemon_running; then
+      echo "cc-busd: 运行中(pid $(cat "$PIDF" 2>/dev/null))"
+      shopt -s nullglob; q=( "$BUS"/queue/*.json ); shopt -u nullglob
+      echo "  队列待处理: ${#q[@]}"
+    else echo "cc-busd: 未运行"; fi
+    ;;
+  *) echo "用法: cc-busd start|stop|status|run" >&2; exit 2;;
+esac
