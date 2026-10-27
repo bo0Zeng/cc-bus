@@ -1,5 +1,7 @@
 # cc-bus
 
+> **Archived.** cc-bus now lives inside [cc-monitor](https://github.com/bo0Zeng/cc-monitor) (`src/shared/cc-bus/`) and depends on its backend; this repository is no longer maintained.
+
 **English** | [中文](README.zh-CN.md)
 
 A message bus for multiple independent **Claude Code** instances running in tmux — let separate

@@ -1,5 +1,7 @@
 # cc-bus
 
+> **已归档。** cc-bus 已并入 [cc-monitor](https://github.com/bo0Zeng/cc-monitor)（`src/shared/cc-bus/`），依赖它的后端；这个仓库不再维护。
+
 [English](README.md) | **中文**
 
 多个各自独立运行在 tmux 里的 **Claude Code** 实例之间的消息总线——让分开的会话互相收发/转发/广播消息,并派生出扎根在指定目录的协作会话,自带智能路由和可选的 broker 守护进程。
